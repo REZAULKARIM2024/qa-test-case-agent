@@ -75,7 +75,7 @@ qa-test-case-agent/
 └── README.md
 ```
 
-## What this demonstrates (for interviews / resume)
+## What this demonstrates 
 
 - Prompt engineering for structured, domain-specific output (JSON schema)
 - Applying real QA test-design techniques (boundary, negative, equivalence)
