@@ -2,6 +2,8 @@
 
 [![CI](https://github.com/REZAULKARIM2024/qa-test-case-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/REZAULKARIM2024/qa-test-case-agent/actions/workflows/ci.yml)
 
+**Live demo:** https://rezaul-test-case-generator.streamlit.app/ - opens with a pre-generated example (no API key needed): validation report, coverage per test type, CSV/JSON download. Add your own Anthropic key in the sidebar to generate cases for any user story.
+
 An AI agent that takes a user story / requirement (plain text) and automatically
 generates a structured set of test cases — positive, negative, edge, and boundary
 scenarios — formatted so they can be imported straight into **Jira/Zephyr** (CSV).
