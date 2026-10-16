@@ -6,7 +6,8 @@ Streamlit web UI for the QA test case generator.
   the sample password-reset story, so a visitor can see the output format,
   the validation report and the CSV download without an API key.
 - With an Anthropic API key in the sidebar, it generates fresh test cases for
-  any user story you paste.
+  any user story you paste, traces them to the story's acceptance criteria and
+  asks once more for any criterion that no test case covers.
 
 Run with:
     streamlit run app.py
@@ -20,16 +21,25 @@ import streamlit as st
 from anthropic import Anthropic
 
 import agent
+import traceability
 
 ROOT = Path(__file__).parent
 SAMPLE_STORY = (ROOT / "sample_input" / "user_story.txt").read_text(encoding="utf-8")
-EXAMPLE_CASES = json.loads((ROOT / "sample_output" / "example_test_cases.json").read_text(encoding="utf-8"))
+EXAMPLE_CASES = json.loads((ROOT / "sample_output" / "example_with_coverage.json").read_text(encoding="utf-8"))
+EXAMPLE_CRITERIA = traceability.extract_criteria(SAMPLE_STORY)
 
 st.set_page_config(page_title="QA Test Case Generator", page_icon="🧪", layout="wide")
 
-if "cases" not in st.session_state:
+def _load_example():
     st.session_state.cases = EXAMPLE_CASES
+    st.session_state.criteria = EXAMPLE_CRITERIA
+    st.session_state.followups = 0
+    st.session_state.followup_error = None
     st.session_state.source = "example"
+
+
+if "cases" not in st.session_state:
+    _load_example()
 
 with st.sidebar:
     st.header("🔑 Generate your own")
@@ -42,8 +52,7 @@ with st.sidebar:
     if not api_key:
         st.caption("No key? Browse the built-in example on the right. It was generated for the sample story.")
     if st.button("↩️ Reset to example", use_container_width=True):
-        st.session_state.cases = EXAMPLE_CASES
-        st.session_state.source = "example"
+        _load_example()
         st.rerun()
 
 st.title("🧪 QA Test Case Generator")
@@ -53,6 +62,12 @@ st.caption(
 )
 
 story = st.text_area("User story / requirement", value=SAMPLE_STORY, height=260)
+detected = traceability.extract_criteria(story)
+if detected:
+    st.caption(f"Detected {len(detected)} acceptance criteria (AC-1 to AC-{len(detected)}). "
+               "Generated test cases will be traced to them.")
+else:
+    st.caption("No 'Acceptance Criteria:' section found. Test cases will be generated without a coverage report.")
 
 if st.button("✨ Generate test cases with Claude", type="primary"):
     if not api_key:
@@ -63,7 +78,11 @@ if st.button("✨ Generate test cases with Claude", type="primary"):
     else:
         try:
             with st.spinner("Generating test cases..."):
-                st.session_state.cases = agent.call_claude(Anthropic(api_key=api_key), story)
+                result = agent.generate_with_coverage(Anthropic(api_key=api_key), story)
+                st.session_state.cases = result["cases"]
+                st.session_state.criteria = result["criteria"]
+                st.session_state.followups = result["followups"]
+                st.session_state.followup_error = result["followup_error"]
                 st.session_state.source = "claude"
         except agent.ModelOutputError as e:
             st.error(f"The model's reply could not be parsed: {e}")
@@ -71,7 +90,8 @@ if st.button("✨ Generate test cases with Claude", type="primary"):
             st.error(f"Request failed: {e}")
 
 cases = st.session_state.cases
-issues = agent.validate_test_cases(cases)
+criteria = st.session_state.criteria
+issues = agent.validate_test_cases(cases, criteria or None)
 coverage = agent.coverage_summary(cases)
 
 st.subheader(
@@ -101,10 +121,66 @@ for i, tc in enumerate(cases, start=1):
             st.markdown(f"{j}. {step}")
         st.markdown(f"**Expected result:** {tc.get('expected_result', '')}")
 
+if criteria:
+    st.subheader("Requirement coverage")
+    if st.session_state.source == "example":
+        st.info("The test cases in this example were generated earlier by Claude. The criterion links (`covers`) "
+                "were added by hand to illustrate the report. Generate with your own key to get the model's own mapping.")
+
+    dropped = st.multiselect(
+        "What if these test cases were removed? (simulation, changes nothing)",
+        options=[f"TC-{i:03d}" for i in range(1, len(cases) + 1)],
+    )
+    kept = [c for i, c in enumerate(cases, start=1) if f"TC-{i:03d}" not in dropped]
+    report = traceability.build_coverage(kept, criteria)
+    if dropped:
+        st.caption("Note: IDs below are renumbered after removal.")
+    s = report["summary"]
+
+    m = st.columns(4)
+    m[0].metric("Criteria", s["criteria"])
+    m[1].metric("Covered", f"{s['covered']} ({s['percent']}%)")
+    m[2].metric("Not covered", s["uncovered"])
+    m[3].metric("Only positive tests", s["thin"])
+
+    if st.session_state.followups:
+        st.caption(f"{st.session_state.followups} follow-up request(s) were made for uncovered criteria.")
+    if st.session_state.followup_error:
+        st.warning(f"A follow-up request failed and was skipped: {st.session_state.followup_error}")
+
+    labels = {"covered": "✅ covered", "thin": "🟡 only positive", "uncovered": "❌ not covered"}
+    st.dataframe(
+        [{"Criterion": r["id"], "Text": r["text"], "Status": labels[r["status"]],
+          "Test cases": ", ".join(r["tests"]), "Types": ", ".join(r["types"])} for r in report["rows"]],
+        use_container_width=True, hide_index=True,
+    )
+    for r in report["rows"]:
+        if r["status"] == "uncovered":
+            st.warning(f"{r['id']} is not covered by any test case: {r['text']}")
+    if report["suspect_links"]:
+        with st.expander(f"🔎 {len(report['suspect_links'])} link(s) to check by hand"):
+            st.caption("These test cases claim a criterion but share no key words with it.")
+            for x in report["suspect_links"]:
+                st.write(f"- {x['test']} claims {x['criterion']}")
+    if report["unknown_refs"]:
+        with st.expander(f"⚠️ {len(report['unknown_refs'])} reference(s) to criteria that do not exist"):
+            for x in report["unknown_refs"]:
+                st.write(f"- {x['test']} references {x['criterion']}")
+    if report["untraced"]:
+        with st.expander(f"{len(report['untraced'])} test case(s) not linked to any criterion"):
+            for t in report["untraced"]:
+                tc = kept[int(t[3:]) - 1]
+                st.write(f"- {t}: {tc.get('title', '') if isinstance(tc, dict) else ''}")
+    st.caption("Coverage is claimed by the model. The checks above catch missing, invented and implausible links, "
+               "but they cannot prove a test verifies its criterion. Review before accepting the set.")
+    st.download_button("⬇️ Download coverage report (Markdown)",
+                       data=traceability.render_markdown(report, kept),
+                       file_name="coverage_report.md", mime="text/markdown", use_container_width=True)
+
 left, right = st.columns(2)
 left.download_button(
     "⬇️ Download CSV (Zephyr/Jira import)",
-    data=agent.to_csv_string([c for c in cases if isinstance(c, dict)]),
+    data=agent.to_csv_string([c for c in cases if isinstance(c, dict)], include_coverage=bool(criteria)),
     file_name="test_cases.csv",
     mime="text/csv",
     use_container_width=True,

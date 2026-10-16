@@ -30,3 +30,28 @@ def test_generate_without_key_shows_a_warning_not_a_crash(monkeypatch):
     generate.click().run()
     assert not at.exception
     assert any("API key" in w.value for w in at.warning)
+
+
+def test_example_shows_requirement_coverage_without_a_key():
+    at = _run()
+    assert not at.exception
+    assert any("Requirement coverage" in s.value for s in at.subheader)
+    labels = [m.label for m in at.metric]
+    assert "Criteria" in labels and "Not covered" in labels
+    covered = next(m for m in at.metric if m.label == "Covered")
+    assert covered.value.startswith("6 (100%)")
+
+
+def test_simulating_removed_test_cases_reveals_a_gap():
+    at = _run()
+    at.multiselect[0].set_value(["TC-003"]).run()   # the only case covering AC-3
+    assert not at.exception
+    assert any("AC-3 is not covered" in w.value for w in at.warning)
+    assert next(m for m in at.metric if m.label == "Not covered").value == "1"
+
+
+def test_story_without_criteria_says_so_before_generating():
+    at = _run()
+    at.text_area[0].set_value("As a user I want to log in.").run()
+    assert not at.exception
+    assert any("No 'Acceptance Criteria:' section" in c.value for c in at.caption)

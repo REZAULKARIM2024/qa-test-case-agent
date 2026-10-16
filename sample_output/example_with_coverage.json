@@ -1,0 +1,144 @@
+[
+  {
+    "title": "Request reset link with a registered email",
+    "priority": "High",
+    "type": "Positive",
+    "preconditions": "A registered, active user account exists with email user@example.com.",
+    "steps": [
+      "Open the login page and click 'Forgot password'.",
+      "Enter user@example.com and submit the form.",
+      "Open the mailbox for user@example.com."
+    ],
+    "expected_result": "A generic confirmation message is shown and a reset email with a link arrives within 2 minutes.",
+    "covers": [
+      "AC-1",
+      "AC-2"
+    ]
+  },
+  {
+    "title": "Complete reset with a valid password before the link expires",
+    "priority": "High",
+    "type": "Positive",
+    "preconditions": "A reset link was requested less than 30 minutes ago.",
+    "steps": [
+      "Click the reset link in the email.",
+      "Enter the new password 'Secure#2026' in both fields.",
+      "Submit the form."
+    ],
+    "expected_result": "The password is updated and the user is redirected to the login page, where the new password works.",
+    "covers": [
+      "AC-5",
+      "AC-6"
+    ]
+  },
+  {
+    "title": "Request reset link with an unregistered email",
+    "priority": "High",
+    "type": "Security",
+    "preconditions": "No account exists for nobody@example.com.",
+    "steps": [
+      "Open the 'Forgot password' form.",
+      "Enter nobody@example.com and submit."
+    ],
+    "expected_result": "The same generic confirmation message is shown as for a registered email, so account existence is not revealed, and no email is sent.",
+    "covers": [
+      "AC-3"
+    ]
+  },
+  {
+    "title": "Use a reset link after it has expired",
+    "priority": "High",
+    "type": "Negative",
+    "preconditions": "A reset link was requested more than 30 minutes ago.",
+    "steps": [
+      "Click the expired reset link.",
+      "Observe the page."
+    ],
+    "expected_result": "The page states the link has expired, does not show the new-password form, and offers to request a new link.",
+    "covers": [
+      "AC-4"
+    ]
+  },
+  {
+    "title": "Reset link at exactly the 30-minute expiry boundary",
+    "priority": "Medium",
+    "type": "Boundary",
+    "preconditions": "A reset link was requested; test clock can be set to 29:59 and 30:01 after the request.",
+    "steps": [
+      "Open the link at 29 minutes 59 seconds after the request.",
+      "Open the same link again at 30 minutes 01 seconds after the request."
+    ],
+    "expected_result": "The link is accepted at 29:59 and rejected as expired at 30:01.",
+    "covers": [
+      "AC-4"
+    ]
+  },
+  {
+    "title": "Reject a new password shorter than 8 characters",
+    "priority": "Medium",
+    "type": "Boundary",
+    "preconditions": "A valid, unexpired reset link is open.",
+    "steps": [
+      "Enter 'Ab1#xyz' (7 characters) as the new password.",
+      "Submit the form."
+    ],
+    "expected_result": "The form is rejected with a message about the minimum length of 8 characters, and the password is not changed.",
+    "covers": [
+      "AC-5"
+    ]
+  },
+  {
+    "title": "Accept a password of exactly 8 characters meeting the policy",
+    "priority": "Medium",
+    "type": "Boundary",
+    "preconditions": "A valid, unexpired reset link is open.",
+    "steps": [
+      "Enter 'Ab1#xyzw' (8 characters) as the new password.",
+      "Submit the form."
+    ],
+    "expected_result": "The password is accepted and updated.",
+    "covers": [
+      "AC-5"
+    ]
+  },
+  {
+    "title": "Reject a new password without a number or special character",
+    "priority": "Medium",
+    "type": "Negative",
+    "preconditions": "A valid, unexpired reset link is open.",
+    "steps": [
+      "Enter 'Password' as the new password.",
+      "Submit the form.",
+      "Repeat with 'Password1' (no special character)."
+    ],
+    "expected_result": "Both attempts are rejected with a message that names the missing requirement, and the password is not changed.",
+    "covers": [
+      "AC-5"
+    ]
+  },
+  {
+    "title": "Existing sessions are invalidated after a successful reset",
+    "priority": "High",
+    "type": "Security",
+    "preconditions": "The user is logged in on two browsers; a reset link has been requested.",
+    "steps": [
+      "Complete the password reset using the link.",
+      "In the second browser, refresh a page that requires login."
+    ],
+    "expected_result": "The second browser's session is no longer valid and the user is asked to log in again.",
+    "covers": [
+      "AC-6"
+    ]
+  },
+  {
+    "title": "A reset link cannot be used twice",
+    "priority": "High",
+    "type": "Security",
+    "preconditions": "A reset link has already been used successfully.",
+    "steps": [
+      "Open the same reset link again."
+    ],
+    "expected_result": "The link is rejected as invalid or already used, and the password cannot be changed with it.",
+    "covers": []
+  }
+]

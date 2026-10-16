@@ -7,6 +7,10 @@ The LLM output is treated as untrusted input: it is parsed defensively,
 validated against the expected schema, and sanitized before being written
 to CSV (so a cell can never be executed as a spreadsheet formula).
 
+If the story has an "Acceptance Criteria:" section, each test case is also traced to the
+criteria it covers, uncovered criteria trigger one follow-up request, and a coverage
+report is written (see traceability.py).
+
 Usage:
     python agent.py --file sample_input/user_story.txt
     python agent.py --text "As a user, I want to ..."
@@ -23,12 +27,16 @@ from pathlib import Path
 
 from anthropic import Anthropic
 
+import traceability
+
 OUTPUT_DIR = Path(__file__).parent / "output"
 CLAUDE_MODEL = "claude-sonnet-4-6"
 
 REQUIRED_FIELDS = ("title", "priority", "type", "preconditions", "steps", "expected_result")
 ALLOWED_PRIORITIES = ("High", "Medium", "Low")
 ALLOWED_TYPES = ("Positive", "Negative", "Boundary", "Security")
+MAX_CASES = 30  # hard cap on the merged test set, so a follow-up round cannot grow it without limit
+CSV_COVERAGE_COLUMN = "Covers (Acceptance Criteria)"
 CSV_FIELDNAMES = [
     "Test Case ID",
     "Title",
@@ -64,6 +72,23 @@ requirement. Be specific to the given requirement — do not write generic
 placeholder steps."""
 
 
+TRACEABILITY_ADDENDUM = """
+
+The requirement comes with numbered acceptance criteria (AC-1, AC-2, ...). In addition,
+every test case must have a "covers" field: an array of the criterion IDs it verifies
+(for example ["AC-2", "AC-4"]). Use ONLY the IDs you were given. Make sure every
+criterion is verified by at least one test case, and give high-risk criteria a negative
+or boundary test as well as a positive one. A test case that checks something outside the
+listed criteria should use an empty array."""
+
+GAP_SYSTEM_PROMPT = SYSTEM_PROMPT.split("Return between")[0].rstrip() + """
+
+You are completing an existing test set. Generate ONLY additional test cases for the
+acceptance criteria listed as NOT COVERED. Do not repeat existing test cases. Add the
+field "covers": an array of the criterion IDs each new test case verifies (use only the
+IDs given). Return between 1 and 6 test cases."""
+
+
 class ModelOutputError(ValueError):
     """The model's reply could not be turned into a list of test cases."""
 
@@ -96,11 +121,12 @@ def parse_model_output(raw_text: str) -> list[dict]:
     return data
 
 
-def validate_test_cases(test_cases: list[dict]) -> list[str]:
+def validate_test_cases(test_cases: list[dict], criteria: list[dict] | None = None) -> list[str]:
     """
     Returns a list of human-readable problems (empty list = all good).
     Checks required fields, allowed enum values, and that steps is a
-    non-empty list of strings.
+    non-empty list of strings. The optional "covers" field must be a list of
+    strings; when `criteria` is given, every id in it must exist.
     """
     issues = []
     if not test_cases:
@@ -121,6 +147,14 @@ def validate_test_cases(test_cases: list[dict]) -> list[str]:
         steps = tc.get("steps")
         if "steps" in tc and (not isinstance(steps, list) or not all(isinstance(s, str) for s in steps)):
             issues.append(f"{label}: 'steps' must be a list of strings.")
+        if "covers" in tc:
+            covers = tc["covers"]
+            if not isinstance(covers, list) or not all(isinstance(c, str) for c in covers):
+                issues.append(f"{label}: 'covers' must be a list of criterion IDs.")
+            elif criteria is not None:
+                known = {c["id"] for c in criteria}
+                for bad in (c for c in covers if c not in known):
+                    issues.append(f"{label}: 'covers' names '{bad}', which is not an acceptance criterion.")
     return issues
 
 
@@ -137,15 +171,75 @@ def coverage_summary(test_cases: list[dict]) -> dict:
 # Calling the model
 # ---------------------------------------------------------------------------
 
-def call_claude(client: Anthropic, requirement_text: str) -> list[dict]:
+def _text_of(response) -> str:
+    return "".join(block.text for block in response.content if block.type == "text")
+
+
+def _criteria_block(criteria: list[dict]) -> str:
+    return "\n".join(f"{c['id']}: {c['text']}" for c in criteria)
+
+
+def call_claude(client: Anthropic, requirement_text: str, criteria: list[dict] | None = None) -> list[dict]:
+    """Without `criteria` this is the original call. With them, the model must also trace each case to criterion IDs."""
+    system = SYSTEM_PROMPT
+    content = f"Requirement:\n\n{requirement_text}"
+    if criteria:
+        system += TRACEABILITY_ADDENDUM
+        content += f"\n\nAcceptance criteria (use these IDs):\n{_criteria_block(criteria)}"
     response = client.messages.create(
         model=CLAUDE_MODEL,
-        max_tokens=2000,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": f"Requirement:\n\n{requirement_text}"}],
+        max_tokens=3500 if criteria else 2000,
+        system=system,
+        messages=[{"role": "user", "content": content}],
     )
-    raw_text = "".join(block.text for block in response.content if block.type == "text")
-    return parse_model_output(raw_text)
+    return parse_model_output(_text_of(response))
+
+
+def call_claude_for_gaps(client: Anthropic, requirement_text: str, gaps: list[dict],
+                         existing_cases: list[dict]) -> list[dict]:
+    """Second pass: ask only for test cases covering the criteria that no existing case claims."""
+    titles = "\n".join(f"- {tc.get('title', '')}" for tc in existing_cases if isinstance(tc, dict))
+    content = (f"Requirement:\n\n{requirement_text}\n\n"
+               f"Existing test case titles (do not repeat):\n{titles}\n\n"
+               f"NOT COVERED acceptance criteria:\n{_criteria_block(gaps)}")
+    response = client.messages.create(
+        model=CLAUDE_MODEL, max_tokens=2000, system=GAP_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": content}],
+    )
+    return parse_model_output(_text_of(response))
+
+
+def generate_with_coverage(client: Anthropic, requirement_text: str, max_followups: int = 1,
+                           case_limit: int = MAX_CASES) -> dict:
+    """
+    Generates test cases; if the story has acceptance criteria, traces them and asks once more
+    for any criterion that no test case claims. Returns
+    {"criteria", "cases", "report", "followups", "followup_error"}. A failed follow-up never loses
+    the first result.
+    """
+    criteria = traceability.extract_criteria(requirement_text)
+    cases = call_claude(client, requirement_text, criteria or None)
+    followups, followup_error = 0, None
+
+    if criteria:
+        for _ in range(max_followups):
+            gaps = traceability.uncovered_criteria(traceability.build_coverage(cases, criteria))
+            if not gaps or len(cases) >= case_limit:
+                break
+            followups += 1
+            try:
+                extra = call_claude_for_gaps(client, requirement_text, gaps, cases)
+            except ModelOutputError as e:
+                followup_error = str(e)
+                break
+            have = {str(tc.get("title", "")).strip().lower() for tc in cases if isinstance(tc, dict)}
+            fresh = [tc for tc in extra if isinstance(tc, dict)
+                     and str(tc.get("title", "")).strip().lower() not in have]
+            cases = cases + fresh[: max(0, case_limit - len(cases))]
+
+    report = traceability.build_coverage(cases, criteria) if criteria else None
+    return {"criteria": criteria, "cases": cases, "report": report,
+            "followups": followups, "followup_error": followup_error}
 
 
 # ---------------------------------------------------------------------------
@@ -164,13 +258,15 @@ def _safe_cell(value) -> str:
     return text
 
 
-def write_csv(file_obj, test_cases: list[dict]):
-    writer = csv.DictWriter(file_obj, fieldnames=CSV_FIELDNAMES)
+def write_csv(file_obj, test_cases: list[dict], include_coverage: bool = False):
+    """include_coverage adds a final column listing the acceptance criteria each case claims to cover."""
+    fieldnames = CSV_FIELDNAMES + ([CSV_COVERAGE_COLUMN] if include_coverage else [])
+    writer = csv.DictWriter(file_obj, fieldnames=fieldnames)
     writer.writeheader()
     for i, tc in enumerate(test_cases, start=1):
         steps = tc.get("steps", [])
         numbered_steps = "\n".join(f"{j}. {s}" for j, s in enumerate(steps, start=1))
-        writer.writerow({
+        row = {
             "Test Case ID": f"TC-{i:03d}",
             "Title": _safe_cell(tc.get("title", "")),
             "Priority": _safe_cell(tc.get("priority", "")),
@@ -178,12 +274,16 @@ def write_csv(file_obj, test_cases: list[dict]):
             "Preconditions": _safe_cell(tc.get("preconditions", "")),
             "Steps": _safe_cell(numbered_steps),
             "Expected Result": _safe_cell(tc.get("expected_result", "")),
-        })
+        }
+        if include_coverage:
+            covers = tc.get("covers") if isinstance(tc.get("covers"), list) else []
+            row[CSV_COVERAGE_COLUMN] = _safe_cell(", ".join(str(c) for c in covers))
+        writer.writerow(row)
 
 
-def to_csv_string(test_cases: list[dict]) -> str:
+def to_csv_string(test_cases: list[dict], include_coverage: bool = False) -> str:
     buffer = io.StringIO()
-    write_csv(buffer, test_cases)
+    write_csv(buffer, test_cases, include_coverage)
     return buffer.getvalue()
 
 
@@ -192,9 +292,9 @@ def save_json(test_cases: list[dict], path: Path):
         json.dump(test_cases, f, ensure_ascii=False, indent=2)
 
 
-def save_csv(test_cases: list[dict], path: Path):
+def save_csv(test_cases: list[dict], path: Path, include_coverage: bool = False):
     with open(path, "w", newline="", encoding="utf-8") as f:
-        write_csv(f, test_cases)
+        write_csv(f, test_cases, include_coverage)
 
 
 def main():
@@ -202,6 +302,8 @@ def main():
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--file", type=str, help="Path to a .txt file with the requirement")
     group.add_argument("--text", type=str, help="Requirement text passed directly")
+    parser.add_argument("--max-followups", type=int, default=1,
+                        help="extra model rounds allowed to cover criteria that no test case claims (default 1)")
     args = parser.parse_args()
 
     api_key = os.environ.get("ANTHROPIC_API_KEY")
@@ -218,12 +320,13 @@ def main():
 
     print("Generating test cases with Claude...")
     try:
-        test_cases = call_claude(client, requirement_text)
+        result = generate_with_coverage(client, requirement_text, max_followups=args.max_followups)
     except ModelOutputError as e:
         print(f"ERROR: {e}")
         sys.exit(1)
+    test_cases, criteria, report = result["cases"], result["criteria"], result["report"]
 
-    issues = validate_test_cases(test_cases)
+    issues = validate_test_cases(test_cases, criteria or None)
     if issues:
         print("WARNING: the model's output has problems:")
         for issue in issues:
@@ -233,13 +336,26 @@ def main():
     csv_path = OUTPUT_DIR / "test_cases.csv"
     json_path = OUTPUT_DIR / "test_cases.json"
 
-    save_csv(test_cases, csv_path)
+    save_csv(test_cases, csv_path, include_coverage=bool(criteria))
     save_json(test_cases, json_path)
 
     print(f"Generated {len(test_cases)} test cases.")
     print(f"Coverage: {coverage_summary(test_cases)}")
     print(f"Saved to {csv_path}")
     print(f"Saved to {json_path}")
+
+    if report:
+        s = report["summary"]
+        report_path = OUTPUT_DIR / "coverage_report.md"
+        report_path.write_text(traceability.render_markdown(report, test_cases), encoding="utf-8")
+        print(f"Acceptance criteria covered: {s['covered']}/{s['criteria']} ({s['percent']}%), "
+              f"{s['uncovered']} not covered, {len(report['suspect_links'])} link(s) to check by hand "
+              f"(follow-up rounds used: {result['followups']})")
+        if result["followup_error"]:
+            print(f"NOTE: the follow-up round failed and was skipped: {result['followup_error']}")
+        print(f"Saved to {report_path}")
+    else:
+        print("No 'Acceptance Criteria:' section found, so no coverage report was produced.")
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/REZAULKARIM2024/qa-test-case-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/REZAULKARIM2024/qa-test-case-agent/actions/workflows/ci.yml)
 
-**Live demo:** https://rezaul-test-case-generator.streamlit.app/ - opens with a pre-generated example (no API key needed): validation report, coverage per test type, CSV/JSON download. Add your own Anthropic key in the sidebar to generate cases for any user story.
+**Live demo:** https://rezaul-test-case-generator.streamlit.app/ - opens with a pre-generated example (no API key needed): validation report, coverage per test type, requirement-coverage report, CSV/JSON download. Add your own Anthropic key in the sidebar to generate cases for any user story.
 
 An AI agent that takes a user story / requirement (plain text) and automatically
 generates a structured set of test cases — positive, negative, edge, and boundary
@@ -37,6 +37,27 @@ The prompt explicitly asks Claude to apply standard test design techniques —
 equivalence partitioning, boundary value analysis, negative testing, and
 common QA fields (Priority, Preconditions, Steps, Expected Result) — so the
 output looks like something a QA engineer would actually write, not generic text.
+
+## Requirement coverage (acceptance-criteria traceability)
+
+If the user story has an `Acceptance Criteria:` section, the agent does more than generate test cases:
+
+1. `traceability.py` extracts the criteria (bullets, numbered lines or Given/When/Then) as `AC-1`, `AC-2`, ...
+2. Each generated test case must say which criteria it verifies (`"covers": ["AC-2", "AC-4"]`).
+3. The code, not the model, checks the claims: criteria nobody covers, IDs the model invented, test cases that claim a
+   criterion but share no key words with it, criteria covered only by positive tests, and test cases linked to nothing.
+4. If a criterion is uncovered, **one** follow-up request asks the model for test cases for just those criteria
+   (capped at one extra round and 30 test cases in total). A failed follow-up never loses the first result.
+5. A Markdown review report (`output/coverage_report.md`, or a download in the UI) lists all of this, and the CSV gets an
+   optional `Covers (Acceptance Criteria)` column for import. Without criteria, nothing changes: the original flow and CSV are untouched.
+
+In the web UI, a "what if these test cases were removed?" box recomputes coverage live, so you can see the gap detector work.
+
+**What this does not prove:** the links are *claimed by the model*. The checks catch missing, invented and implausible
+links, but they cannot show that a test truly verifies its criterion, so the report ends with a reminder to review by hand.
+In the built-in example the test cases were generated earlier by Claude and the `covers` links were added by hand to
+illustrate the report. The follow-up round and the traceability prompt are tested with a fake model only; they have not been
+measured against a live model.
 
 ## Setup
 
@@ -101,6 +122,9 @@ pytest -v
 | CSV export | header, sequential IDs, numbered steps, commas/quotes/newlines, Unicode, **formula injection** |
 | Model call | requirement text and system prompt reach the model; bad replies raise a clear error |
 | Web UI | the Streamlit app loads, shows the example and handles a missing API key (Streamlit `AppTest`) |
+| Criteria extraction | bullets, numbering, Given/When/Then, wrapped lines, next-section stop, caps on count and length |
+| Coverage checks | covered / thin / uncovered, invented IDs, untraced cases, implausible links, report table safety |
+| Follow-up round | only uncovered criteria are requested, duplicates dropped, rounds and size capped, failures keep the first result |
 
 GitHub Actions runs the suite on every push and pull request. The key tests were
 also checked by mutation: breaking the injection guard or the priority check
@@ -110,10 +134,11 @@ makes the suite fail.
 
 ```
 qa-test-case-agent/
-├── agent.py                     # CLI agent: prompt, parsing, validation, export
+├── agent.py                     # CLI agent: prompt, parsing, validation, export, follow-up round
+├── traceability.py              # acceptance-criteria extraction, coverage checks, review report
 ├── app.py                       # Streamlit web UI
 ├── sample_input/user_story.txt  # example requirement to try it on
-├── sample_output/               # pre-generated example used by the UI and tests
+├── sample_output/               # pre-generated examples used by the UI and tests
 ├── tests/                       # pytest suite (offline)
 ├── .github/workflows/ci.yml     # CI
 ├── output/                      # generated CSV/JSON (gitignored)
@@ -130,6 +155,8 @@ qa-test-case-agent/
 - Output formatted for direct integration into existing QA tools (Jira/Zephyr)
 - Treating LLM output as untrusted: schema validation and CSV-injection protection
 - Testing an LLM application offline with fakes, plus CI on every push
+- Checking a model's own claims (traceability) with deterministic code instead of trusting them
+- Mutation-checking the rules: breaking each one by hand makes a test fail
 
 ## Possible extensions
 
